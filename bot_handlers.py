@@ -39,34 +39,80 @@ class OwnerFlow(StatesGroup):
     add_forced_channel = State()
     set_limits_wait = State()
 
-# ---------------- Menu ----------------
-def user_menu(user_id):
-    kb = [
-        [InlineKeyboardButton(text="📱 إضافة رقم", callback_data="add_number")],
-        [InlineKeyboardButton(text="👥 إضافة كروب", callback_data="add_group")],
-        [InlineKeyboardButton(text="💬 إضافة كليشة", callback_data="add_cliche")],
-        [InlineKeyboardButton(text="📦 إنشاء مجموعة", callback_data="add_bundle")],
-        [InlineKeyboardButton(text="📋 مجموعاتي", callback_data="my_bundles")],
-    ]
-    if user_id == OWNER_ID:
-        kb.append([InlineKeyboardButton(text="⚙️ لوحة المالك", callback_data="owner_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-def owner_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚫 حظر عضو/بوت", callback_data="own_block")],
-        [InlineKeyboardButton(text="✅ إلغاء حظر", callback_data="own_unblock")],
-        [InlineKeyboardButton(text="💬 إضافة كليشة للمالك", callback_data="own_cliche")],
-        [InlineKeyboardButton(text="📢 إضافة قناة إجبارية", callback_data="own_forced")],
-        [InlineKeyboardButton(text="📊 تحديد حدود عضو", callback_data="own_limits")],
-        [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")],
-    ])
-
+# ---------------- Access check ----------------
 async def check_access(user_id):
     if await db.is_blocked(user_id):
         return False
     await db.ensure_user(user_id)
     return True
+
+async def check_forced_channel(bot, user_id):
+    """يرجع True إذا كان العضو مشتركاً في القناة الإجبارية أو لا توجد قناة."""
+    fc = await db.get_forced_channel()
+    if not fc:
+        return True
+    try:
+        member = await bot.get_chat_member(int(fc["channel_id"]), user_id)
+        if member.status in ("member", "administrator", "creator"):
+            return True
+    except Exception:
+        pass
+    return False
+
+async def send_forced_subscribe(bot, message_or_cb):
+    """يرسل رسالة الاشتراك الإجباري مع زر."""
+    fc = await db.get_forced_channel()
+    if not fc:
+        return
+    link = fc["channel_link"]
+    if not link.startswith("http"):
+        link = "https://t.me/" + link.lstrip("@")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 اشترك في القناة", url=link)],
+        [InlineKeyboardButton(text="✅ تحققت", callback_data="check_sub")],
+    ])
+    text = "⚠️ للاستفادة من البوت، يجب الاشتراك في قناتنا أولاً:"
+    if isinstance(message_or_cb, CallbackQuery):
+        await message_or_cb.message.answer(text, reply_markup=kb)
+    else:
+        await message_or_cb.answer(text, reply_markup=kb)
+
+# ---------------- Menus ----------------
+def user_menu(user_id):
+    """قائمة العضو: زرين فقط + زر المالك إن كان مالكاً."""
+    kb = [
+        [InlineKeyboardButton(text="📦 المجموعة الأولى", callback_data="bundle1")],
+        [InlineKeyboardButton(text="➕ إضافة مجموعة", callback_data="add_bundle")],
+    ]
+    if user_id == OWNER_ID:
+        kb.append([InlineKeyboardButton(text="⚙️ لوحة المالك", callback_data="owner_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def bundle1_menu():
+    """داخل المجموعة الأولى: إضافة رقم/كروب/كليشة + رجوع."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 إضافة رقم", callback_data="add_number")],
+        [InlineKeyboardButton(text="👥 إضافة كروب", callback_data="add_group")],
+        [InlineKeyboardButton(text="💬 إضافة كليشة", callback_data="add_cliche")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")],
+    ])
+
+def owner_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 حظر عضو/بوت", callback_data="own_block")],
+        [InlineKeyboardButton(text="✅ إلغاء حظر", callback_data="own_unblock")],
+        [InlineKeyboardButton(text="💬 كليشات الأدمن", callback_data="own_cliches")],
+        [InlineKeyboardButton(text="📢 تعيين القناة الإجبارية", callback_data="own_forced")],
+        [InlineKeyboardButton(text="📊 تحديد حدود عضو", callback_data="own_limits")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")],
+    ])
+
+def admin_cliches_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ إضافة كليشة", callback_data="own_cliche_add")],
+        [InlineKeyboardButton(text="🗑 حذف كليشة", callback_data="own_cliche_del_list")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="owner_menu")],
+    ])
 
 # ---------------- /start ----------------
 @router.message(Command("start"))
@@ -75,12 +121,36 @@ async def cmd_start(msg: Message, state: FSMContext):
     if not await check_access(msg.from_user.id):
         await msg.answer("🚫 أنت محظور من استخدام البوت.")
         return
+    if not await check_forced_channel(msg.bot, msg.from_user.id):
+        await send_forced_subscribe(msg.bot, msg)
+        return
     await msg.answer("👋 مرحبًا بك!\nاختر من القائمة:", reply_markup=user_menu(msg.from_user.id))
+
+@router.callback_query(F.data == "check_sub")
+async def cb_check_sub(cb: CallbackQuery):
+    if not await check_access(cb.from_user.id):
+        await cb.answer("محظور", show_alert=True); return
+    if not await check_forced_channel(cb.bot, cb.from_user.id):
+        await cb.answer("❌ لم تشترك بعد!", show_alert=True)
+        return
+    await cb.message.edit_text("✅ تم التحقق!\nاختر من القائمة:", reply_markup=user_menu(cb.from_user.id))
+    await cb.answer()
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text("اختر من القائمة:", reply_markup=user_menu(cb.from_user.id))
+    await cb.answer()
+
+# ---------------- Bundle 1 (المجموعة الأولى) ----------------
+@router.callback_query(F.data == "bundle1")
+async def cb_bundle1(cb: CallbackQuery):
+    if not await check_access(cb.from_user.id):
+        await cb.answer("محظور", show_alert=True); return
+    await cb.message.edit_text(
+        "📦 المجموعة الأولى\n\nأضف رقمك، كروبك، وكليشتك:",
+        reply_markup=bundle1_menu()
+    )
     await cb.answer()
 
 # ---------------- Add Number ----------------
@@ -100,6 +170,10 @@ async def cb_add_number(cb: CallbackQuery, state: FSMContext):
 @router.message(AddNumber.waiting_phone)
 async def process_phone(msg: Message, state: FSMContext):
     phone = msg.text.strip()
+    # منع تكرار الرقم
+    if await db.session_phone_exists(phone):
+        await msg.answer("⚠️ هذا الرقم مسجل بالفعل في البوت.\nأرسل رقماً آخر أو /start")
+        return
     status, client = await ub_manager.start_login(msg.from_user.id, phone)
     if status == "code_sent":
         await msg.answer("✅ تم إرسال كود التحقق.\n📩 أرسل الكود الآن:")
@@ -115,7 +189,7 @@ async def process_phone(msg: Message, state: FSMContext):
 async def process_code(msg: Message, state: FSMContext):
     status, data = await ub_manager.verify_code(msg.from_user.id, msg.text.strip())
     if status == "success":
-        await msg.answer("✅ تم تسجيل الدخول!", reply_markup=user_menu(msg.from_user.id))
+        await msg.answer("✅ تم تسجيل الدخول!", reply_markup=bundle1_menu())
         await state.clear()
     elif status == "password_needed":
         await msg.answer("🔐 الحساب محمي بـ 2FA. أرسل كلمة المرور:")
@@ -127,7 +201,7 @@ async def process_code(msg: Message, state: FSMContext):
 async def process_password(msg: Message, state: FSMContext):
     status, _ = await ub_manager.verify_password(msg.from_user.id, msg.text.strip())
     if status == "success":
-        await msg.answer("✅ تم تسجيل الدخول!", reply_markup=user_menu(msg.from_user.id))
+        await msg.answer("✅ تم تسجيل الدخول!", reply_markup=bundle1_menu())
     else:
         await msg.answer(f"❌ فشل: {status}")
     await state.clear()
@@ -149,7 +223,7 @@ async def cb_add_group(cb: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=s["phone"], callback_data=f"grpsess_{s['id']}")]
         for s in sessions
-    ])
+    ] + [[InlineKeyboardButton(text="🔙 رجوع", callback_data="bundle1")]])
     await cb.message.answer("📱 اختر الرقم:", reply_markup=kb)
     await state.set_state(AddGroup.waiting_session)
     await cb.answer()
@@ -172,7 +246,7 @@ async def process_group_link(msg: Message, state: FSMContext):
         await state.clear(); return
     gid, title = result
     await db.add_group(msg.from_user.id, gid, title)
-    await msg.answer(f"✅ تم حفظ الكروب: {title}", reply_markup=user_menu(msg.from_user.id))
+    await msg.answer(f"✅ تم حفظ الكروب: {title}", reply_markup=bundle1_menu())
     await state.clear()
 
 # ---------------- Add Cliche ----------------
@@ -192,22 +266,22 @@ async def cb_add_cliche(cb: CallbackQuery, state: FSMContext):
 @router.message(AddCliche.waiting_text)
 async def process_cliche(msg: Message, state: FSMContext):
     await db.add_cliche(msg.from_user.id, msg.text)
-    await msg.answer("✅ تم حفظ الكليشة.", reply_markup=user_menu(msg.from_user.id))
+    await msg.answer("✅ تم حفظ الكليشة.", reply_markup=bundle1_menu())
     await state.clear()
 
-# ---------------- Create Bundle ----------------
+# ---------------- Create Bundle (إضافة مجموعة) ----------------
 @router.callback_query(F.data == "add_bundle")
 async def cb_add_bundle(cb: CallbackQuery, state: FSMContext):
     if not await check_access(cb.from_user.id):
         await cb.answer(); return
     sessions = await db.get_user_sessions(cb.from_user.id)
     if not sessions:
-        await cb.message.answer("⚠️ أضف رقم أولاً.")
+        await cb.message.answer("⚠️ أضف رقم أولاً من (المجموعة الأولى → إضافة رقم).")
         await cb.answer(); return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=s["phone"], callback_data=f"bsess_{s['id']}")]
         for s in sessions
-    ])
+    ] + [[InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")]])
     await cb.message.answer("📱 اختر الرقم:", reply_markup=kb)
     await state.set_state(CreateBundle.select_session)
     await cb.answer()
@@ -218,13 +292,13 @@ async def cb_bundle_session(cb: CallbackQuery, state: FSMContext):
     await state.update_data(b_session=sid)
     groups = await db.get_user_groups(cb.from_user.id)
     if not groups:
-        await cb.message.answer("⚠️ أضف كروب أولاً.")
+        await cb.message.answer("⚠️ أضف كروب أولاً من (المجموعة الأولى → إضافة كروب).")
         await cb.answer(); return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=g["group_title"] or str(g["group_id"]),
                               callback_data=f"bgrp_{g['id']}")]
         for g in groups
-    ])
+    ] + [[InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")]])
     await cb.message.answer("👥 اختر الكروب:", reply_markup=kb)
     await state.set_state(CreateBundle.select_group)
     await cb.answer()
@@ -235,12 +309,12 @@ async def cb_bundle_group(cb: CallbackQuery, state: FSMContext):
     await state.update_data(b_group=gid)
     cs = await db.get_user_cliches(cb.from_user.id)
     if not cs:
-        await cb.message.answer("⚠️ أضف كليشة أولاً.")
+        await cb.message.answer("⚠️ أضف كليشة أولاً من (المجموعة الأولى → إضافة كليشة).")
         await cb.answer(); return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=(c["text"][:40] or "..."), callback_data=f"bcli_{c['id']}")]
         for c in cs
-    ])
+    ] + [[InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")]])
     await cb.message.answer("💬 اختر الكليشة:", reply_markup=kb)
     await state.set_state(CreateBundle.select_cliche)
     await cb.answer()
@@ -299,7 +373,7 @@ async def cb_my_bundles(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🗑 حذف #{b['id']}", callback_data=f"delb_{b['id']}")]
         for b in bundles
-    ])
+    ] + [[InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")]])
     await cb.message.answer(text, reply_markup=kb)
     await cb.answer()
 
@@ -358,34 +432,91 @@ async def proc_unblock(msg: Message, state: FSMContext):
         await msg.answer("❌ ID غير صحيح.")
     await state.clear()
 
-@router.callback_query(F.data == "own_cliche")
-async def cb_own_cliche(cb: CallbackQuery, state: FSMContext):
+# ---------------- Admin Cliches (إضافة/حذف) ----------------
+@router.callback_query(F.data == "own_cliches")
+async def cb_own_cliches(cb: CallbackQuery):
     if cb.from_user.id != OWNER_ID: await cb.answer(); return
-    await cb.message.answer("أرسل نص كليشة المالك:")
+    await cb.message.edit_text("💬 كليشات الأدمن:", reply_markup=admin_cliches_menu())
+    await cb.answer()
+
+@router.callback_query(F.data == "own_cliche_add")
+async def cb_own_cliche_add(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID: await cb.answer(); return
+    await cb.message.answer("أرسل نص كليشة الأدمن:")
     await state.set_state(OwnerFlow.add_admin_cliche)
     await cb.answer()
 
 @router.message(OwnerFlow.add_admin_cliche)
 async def proc_admin_cliche(msg: Message, state: FSMContext):
     await db.add_admin_cliche(msg.text)
-    await msg.answer("✅ تم حفظ كليشة المالك.")
+    await msg.answer("✅ تم حفظ كليشة الأدمن.", reply_markup=admin_cliches_menu())
     await state.clear()
 
+@router.callback_query(F.data == "own_cliche_del_list")
+async def cb_own_cliche_del_list(cb: CallbackQuery):
+    if cb.from_user.id != OWNER_ID: await cb.answer(); return
+    cliches = await db.get_all_admin_cliches()
+    if not cliches:
+        await cb.message.answer("📭 لا توجد كليشات أدمن.")
+        await cb.answer(); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗑 {c['text'][:30]}", callback_data=f"delac_{c['id']}")]
+        for c in cliches
+    ] + [[InlineKeyboardButton(text="🔙 رجوع", callback_data="own_cliches")]])
+    await cb.message.answer("اختر كليشة لحذفها:", reply_markup=kb)
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("delac_"))
+async def cb_del_admin_cliche(cb: CallbackQuery):
+    if cb.from_user.id != OWNER_ID: await cb.answer(); return
+    cid = int(cb.data.split("_")[1])
+    await db.delete_admin_cliche(cid)
+    await cb.message.edit_text(f"✅ تم حذف كليشة الأدمن #{cid}.")
+    await cb.answer()
+
+# ---------------- Forced Channel ----------------
 @router.callback_query(F.data == "own_forced")
 async def cb_own_forced(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != OWNER_ID: await cb.answer(); return
-    await cb.message.answer("أرسل @username القناة الإجبارية:")
+    await cb.message.answer(
+        "أرسل @username أو ID القناة الإجبارية.\n"
+        "⚠️ يجب أن يكون البوت مشرفاً في القناة."
+    )
     await state.set_state(OwnerFlow.add_forced_channel)
     await cb.answer()
 
 @router.message(OwnerFlow.add_forced_channel)
 async def proc_forced(msg: Message, state: FSMContext):
     link = msg.text.strip()
-    cid = link.lstrip("@")
-    await db.add_forced_channel(cid, link)
-    await msg.answer(f"✅ تم إضافة القناة: {link}")
+    if not link:
+        await msg.answer("❌ أرسل رابطاً صالحاً.")
+        return
+    try:
+        if link.startswith("https://t.me/"):
+            username = link.split("/")[-1]
+            chat = await msg.bot.get_chat("@" + username)
+        elif link.startswith("@"):
+            chat = await msg.bot.get_chat(link)
+        else:
+            chat = await msg.bot.get_chat(int(link))
+        cid = chat.id
+        title = chat.title or str(cid)
+        # التحقق من أن البوت مشرف
+        try:
+            me = await msg.bot.get_chat_member(cid, msg.bot.id)
+            if me.status not in ("administrator", "creator"):
+                await msg.answer("❌ البوت ليس مشرفاً في هذه القناة. أضفه كمشرف أولاً.")
+                return
+        except Exception:
+            await msg.answer("❌ تعذر التحقق من إشراف البوت. تأكد من إضافته كمشرف.")
+            return
+        await db.set_forced_channel(cid, link)
+        await msg.answer(f"✅ تم تعيين القناة الإجبارية: {title}")
+    except Exception as e:
+        await msg.answer(f"❌ خطأ: {e}\nتأكد من الرابط أو ID القناة.")
     await state.clear()
 
+# ---------------- Limits ----------------
 @router.callback_query(F.data == "own_limits")
 async def cb_own_limits(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != OWNER_ID: await cb.answer(); return
