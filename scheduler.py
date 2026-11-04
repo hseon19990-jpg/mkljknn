@@ -6,6 +6,7 @@ import database as db
 from userbot import ub_manager
 from config import FAILURES_BEFORE_COMA, COMA_HOURS
 
+
 class SchedulerManager:
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
@@ -19,35 +20,32 @@ class SchedulerManager:
         bundle = await db.get_bundle(bundle_id)
         if not bundle or not bundle["is_active"]:
             return
+        if not bundle.get("session_id") or not bundle.get("group_id") or not bundle.get("cliche_id"):
+            return
 
         now = datetime.now()
 
-        # ---- التحقق من الغيبوبة ----
         coma_until = bundle.get("coma_until")
         if coma_until:
             try:
                 until_dt = datetime.fromisoformat(coma_until)
                 if now < until_dt:
-                    return  # لا يزال في غيبوبة
-                # انتهت الغيبوبة → مسحها وتصفير العدادات
+                    return
                 await db.clear_bundle_coma(bundle_id)
                 await db.reset_bundle_failures(bundle_id)
-                print(f"[Scheduler] Bundle {bundle_id} exited coma")
             except Exception:
                 pass
 
-        # ---- التحقق من FloodWait ----
         flood_until = bundle.get("flood_until")
         if flood_until:
             try:
                 until_dt = datetime.fromisoformat(flood_until)
                 if now < until_dt:
-                    return  # لا يزال في flood
+                    return
                 await db.clear_bundle_flood(bundle_id)
             except Exception:
                 pass
 
-        # ---- اختيار الكليشة ----
         state = self.bundle_state.get(bundle_id, "user")
         if state == "user":
             cliche = await db.get_cliche(bundle["cliche_id"])
@@ -60,12 +58,10 @@ class SchedulerManager:
 
         if not text:
             return
-
         grp = await db.get_group(bundle["group_id"])
         if not grp:
             return
 
-        # ---- الإرسال ----
         status, extra = await ub_manager.send_with_reply(
             bundle["session_id"], grp["group_id"], text
         )
@@ -74,17 +70,13 @@ class SchedulerManager:
             await db.reset_bundle_failures(bundle_id)
         elif status == "flood":
             await db.set_bundle_flood(bundle_id, int(extra) + 1)
-            print(f"[Scheduler] Bundle {bundle_id} flood for {extra}s")
         elif status == "no_target":
-            # لا يوجد عضو بشري للرد عليه — لا نحسبها فشلًا
             pass
         elif status in ("restricted", "error"):
             count = await db.increment_bundle_failure(bundle_id)
-            print(f"[Scheduler] Bundle {bundle_id} failure #{count} ({status})")
             if count >= FAILURES_BEFORE_COMA:
                 await db.set_bundle_coma(bundle_id, hours=COMA_HOURS)
                 await db.reset_bundle_failures(bundle_id)
-                print(f"[Scheduler] Bundle {bundle_id} entered coma for {COMA_HOURS}h")
 
     def schedule_bundle(self, bundle_id, interval):
         job_id = f"bundle_{bundle_id}"
@@ -112,5 +104,6 @@ class SchedulerManager:
         for b in bundles:
             self.schedule_bundle(b["id"], b["interval"])
         print(f"[Scheduler] Reloaded {len(bundles)} bundles")
+
 
 scheduler_mgr = SchedulerManager()
