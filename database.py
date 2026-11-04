@@ -69,7 +69,7 @@ async def init_db():
         """)
         await db.commit()
 
-        # Migrations
+        # Migrations for existing DBs
         for col, definition in [
             ("name", "TEXT"),
             ("failure_count", "INTEGER DEFAULT 0"),
