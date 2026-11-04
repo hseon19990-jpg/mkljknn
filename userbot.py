@@ -124,7 +124,7 @@ class UserbotManager:
 
     # ---------- Listeners ----------
     def _register_listeners(self, session_id, client):
-        @client.on(events.NewMessage(incoming=True)) # <--- إضافة incoming=True لتجاهل رسائل الحساب نفسه
+        @client.on(events.NewMessage(incoming=True))
         async def _on_msg(event):
             try:
                 await self._process_event(session_id, event)
@@ -144,33 +144,34 @@ class UserbotManager:
         المنطق: كل رسالة في أي كروب مرتبط بهذه الجلسة → استخراج الروابط → فتحها.
         الحساب هو "العين" التي ترى وتنضم، وليس البوت.
         """
-        # 1. طباعة أسماء الكروبات التي يراها الحساب (للتشخيص)
-        chat = await event.get_chat()
-        chat_title = getattr(chat, "title", str(event.chat_id))
         chat_id = event.chat_id
-        
         if not chat_id:
             return
 
-        # 2. هل هذه الجلسة مرتبطة بأي bundle في هذا الكروب؟
+        # هل هذه الجلسة مرتبطة بأي bundle في هذا الكروب؟
         bundles = await db._fetchall(
             "SELECT * FROM bundles WHERE session_id=?", (session_id,)
         )
+        if not bundles:
+            return
+
         matched = False
         for b in bundles:
             if b.get("group_id"):
                 grp = await db.get_group(b["group_id"])
                 if grp:
-                    # المقارنة تاخذ بالحسبان الصيغ المختلفة للـ ID
-                    if int(grp["group_id"]) == int(chat_id) or str(grp["group_id"]) in str(chat_id):
-                        matched = True
-                        break
-                        
-        # إذا لم يكن مرتبطاً بـ bundle، نتخطاه (إلا إذا كنا نريد طباعة كل شيء للتشخيص)
+                    try:
+                        if int(grp["group_id"]) == int(chat_id):
+                            matched = True
+                            break
+                    except (ValueError, TypeError):
+                        if str(grp["group_id"]) == str(chat_id):
+                            matched = True
+                            break
         if not matched:
             return
 
-        # 3. تجاهل المحظورين
+        # تجاهل المحظورين
         try:
             sender = await event.get_sender()
             if sender and await db.is_blocked(sender.id):
@@ -178,25 +179,23 @@ class UserbotManager:
         except Exception:
             pass
 
-        # 4. النص من الرسالة (يدعم الميديا والكابشن)
+        # النص من الرسالة (يدعم الميديا والكابشن)
         text = event.raw_text or ""
         if not text and event.message:
             text = getattr(event.message, "message", "") or ""
-        
-        print(f"[DEBUG] رسالة في {chat_title}: {text[:50]}") # للتشخيص
-        
         if not text:
             return
 
-        # 5. استخراج الروابط
+        # استخراج الروابط
         links = self._extract_links(text)
         if not links:
             return
 
-        print(f"[Listen] Found {len(links)} link(s) in {chat_title}: {links}")
+        print(f"[Listen] Found {len(links)} link(s) in chat {chat_id}: {links}")
+
         client = self.get_client(session_id)
         if not client:
-            print(f"[Error] Client {session_id} not found!")
+            print(f"[Listen] No client for session {session_id}")
             return
 
         for link in links:
@@ -212,7 +211,6 @@ class UserbotManager:
             if invite_hash:
                 results.add("https://t.me/+" + invite_hash)
             elif public_name:
-                # تجاهل الروابط التي قد تكون يوزر للكروب نفسه
                 results.add("@" + public_name)
             elif mention:
                 results.add(mention)
@@ -220,20 +218,19 @@ class UserbotManager:
 
     async def _open_and_join(self, session_id, client, link):
         """
-        يحاول فتح الرابط. إذا كان قناة/مجموعة → ينضم.
+        يفتح الرابط. إذا كان قناة/مجموعة → ينضم.
         إذا كان بوت/شخص → يتجاهل.
         """
+        print(f"[Open] Trying: {link}")
         ent = None
-        print(f"[Join Attempt] {link}")
         try:
             ent = await client.get_entity(link)
         except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-            # قد يكون رابط دعوة (invite hash)
             if "t.me/+" in link or "joinchat/" in link:
                 ent = await self._resolve_invite(client, link)
             if ent is None:
-                print(f"[Join] {link}: get_entity failed.")
-                return  # غير موجود
+                print(f"[Open] {link}: could not resolve")
+                return
         except ChannelPrivateError:
             if "t.me/+" in link:
                 ent = await self._resolve_invite(client, link)
@@ -243,16 +240,14 @@ class UserbotManager:
             await self._join_direct(session_id, client, link)
             return
 
-        # تجاهل البوتات والأشخاص
         if isinstance(ent, User):
-            print(f"[Ignore] {link} is a User/Bot.")
-            return  
+            print(f"[Open] {link}: is user/bot — ignoring")
+            return
         if isinstance(ent, (ChatForbidden, ChannelForbidden)):
             return
         if not isinstance(ent, (Channel, Chat)):
             return
 
-        # نحاول الانضمام
         await self._join_direct(session_id, client, link)
 
     async def _resolve_invite(self, client, link):
@@ -270,7 +265,7 @@ class UserbotManager:
             if upd.chats:
                 return upd.chats[0]
         except (InviteHashExpiredError, InviteHashInvalidError):
-            print(f"[Invite] {link}: Expired/Invalid")
+            print(f"[Invite] {link}: expired/invalid")
             return None
         except Exception as e:
             print(f"[Invite] {link}: {e}")
@@ -286,7 +281,7 @@ class UserbotManager:
             joined = True
             print(f"[Join] Already in: {link}")
         except ChannelsTooMuchError:
-            print(f"[Join] Limit hit. Leaving {CHANNEL_LIMIT_LEAVE_COUNT} channels...")
+            print(f"[Join] Limit. Leaving {CHANNEL_LIMIT_LEAVE_COUNT}...")
             await self._leave_oldest_channels(client, count=CHANNEL_LIMIT_LEAVE_COUNT)
             try:
                 await client.join_chat(link)
