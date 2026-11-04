@@ -117,12 +117,29 @@ async def add_admin_cliche(text):
 async def get_all_admin_cliches():
     return await _fetchall("SELECT * FROM admin_cliches")
 
-# -------- Forced channels --------
-async def add_forced_channel(cid, link):
-    await _exec("INSERT OR IGNORE INTO forced_channels(channel_id, channel_link) VALUES(?,?)", (cid, link))
+async def get_admin_cliche(cid):
+    return await _fetchone("SELECT * FROM admin_cliches WHERE id=?", (cid,))
 
-async def get_forced_channels():
-    return await _fetchall("SELECT * FROM forced_channels")
+async def delete_admin_cliche(cid):
+    await _exec("DELETE FROM admin_cliches WHERE id=?", (cid,))
+
+# -------- Forced channels (single) --------
+async def set_forced_channel(channel_id, channel_link):
+    """يخزن قناة إجبارية واحدة فقط (يستبدل القديمة)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM forced_channels")
+        await db.execute(
+            "INSERT INTO forced_channels(channel_id, channel_link) VALUES(?,?)",
+            (str(channel_id), channel_link)
+        )
+        await db.commit()
+
+async def get_forced_channel():
+    """يرجع القناة الإجبارية الوحيدة أو None."""
+    return await _fetchone("SELECT * FROM forced_channels LIMIT 1")
+
+async def clear_forced_channel():
+    await _exec("DELETE FROM forced_channels")
 
 # -------- Limits --------
 async def set_limits(user_id, mn, mg, mc):
@@ -147,6 +164,11 @@ async def get_session(sid):
 
 async def get_all_active_sessions():
     return await _fetchall("SELECT * FROM sessions WHERE is_active=1")
+
+async def session_phone_exists(phone):
+    """يتحقق إن كان الرقم مسجلاً مسبقاً (لأي مستخدم)."""
+    r = await _fetchone("SELECT 1 FROM sessions WHERE phone=? AND is_active=1", (phone,))
+    return r is not None
 
 # -------- Groups --------
 async def add_group(user_id, gid, title):
