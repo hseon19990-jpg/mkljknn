@@ -69,7 +69,7 @@ async def init_db():
         """)
         await db.commit()
 
-        # Migrations for existing DBs
+        # Migrations
         for col, definition in [
             ("name", "TEXT"),
             ("failure_count", "INTEGER DEFAULT 0"),
@@ -240,8 +240,27 @@ async def get_all_active_sessions():
 
 
 async def session_phone_exists(phone):
-    r = await _fetchone("SELECT 1 FROM sessions WHERE phone=? AND is_active=1", (phone,))
+    """الرقم يعتبر مسجلاً فقط إذا كانت جلسته مرتبطة فعلاً بمجموعة (bundle)."""
+    r = await _fetchone(
+        "SELECT 1 FROM sessions s JOIN bundles b ON b.session_id = s.id "
+        "WHERE s.phone=? AND s.is_active=1", (phone,))
     return r is not None
+
+
+async def is_session_in_use(session_id):
+    r = await _fetchone("SELECT 1 FROM bundles WHERE session_id=?", (session_id,))
+    return r is not None
+
+
+async def deactivate_session(session_id):
+    await _exec("UPDATE sessions SET is_active=0 WHERE id=?", (session_id,))
+
+
+async def get_orphan_sessions_by_phone(phone):
+    """جلسات نشطة لهذا الرقم لا ترتبط بأي مجموعة (بقايا حذف سابق)."""
+    return await _fetchall(
+        "SELECT s.* FROM sessions s WHERE s.phone=? AND s.is_active=1 "
+        "AND NOT EXISTS (SELECT 1 FROM bundles b WHERE b.session_id = s.id)", (phone,))
 
 
 # -------- Groups --------
