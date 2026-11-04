@@ -219,6 +219,23 @@ async def render_bundle(cb_or_msg, bid, edit=True):
 
 
 # ---------------- /start ----------------
+async def release_session(sid):
+    """إذا لم تعد الجلسة مرتبطة بأي مجموعة: نعطّلها ونفصل الحساب ليمكن إضافة الرقم من جديد."""
+    if not sid:
+        return
+    if await db.is_session_in_use(sid):
+        return
+    await db.deactivate_session(sid)
+    await ub_manager.drop_client(sid)
+
+
+async def release_stale_phone(phone):
+    """بقايا جلسات قديمة لنفس الرقم (من حذف سابق) تُنظَّف قبل التحقق."""
+    for o in await db.get_orphan_sessions_by_phone(phone):
+        await db.deactivate_session(o["id"])
+        await ub_manager.drop_client(o["id"])
+
+
 @router.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
@@ -313,6 +330,7 @@ async def new_bundle_name(msg: Message, state: FSMContext):
 @router.message(NewBundle.waiting_number_phone)
 async def new_bundle_phone(msg: Message, state: FSMContext):
     phone = msg.text.strip()
+    await release_stale_phone(phone)
     if await db.session_phone_exists(phone):
         await msg.answer("⚠️ هذا الرقم مسجل بالفعل.\nأرسل رقماً آخر.")
         return
@@ -466,6 +484,7 @@ async def cb_e_num(cb: CallbackQuery, state: FSMContext):
 @router.message(EditBundle.add_number_phone)
 async def edit_num_phone(msg: Message, state: FSMContext):
     phone = msg.text.strip()
+    await release_stale_phone(phone)
     if await db.session_phone_exists(phone):
         await msg.answer("⚠️ هذا الرقم مسجل بالفعل.\nأرسل رقماً آخر.")
         return
@@ -487,7 +506,11 @@ async def edit_num_code(msg: Message, state: FSMContext):
         bid = d.get("edit_bid")
         await db.set_bundle_active(bid, False)
         scheduler_mgr.unschedule_bundle(bid)
+        _prev = await db.get_bundle(bid)
+        old_sid = _prev.get("session_id") if _prev else None
         await db.update_bundle_session(bid, sid)
+        if old_sid != sid:
+            await release_session(old_sid)
         await msg.answer("✅ تم استبدال الرقم. المجموعة متوقفة، اضغط ▶️ للتشغيل.")
         kb = await build_main_menu(msg.from_user.id)
         await msg.answer("اختر من القائمة:", reply_markup=kb)
@@ -507,7 +530,11 @@ async def edit_num_password(msg: Message, state: FSMContext):
         bid = d.get("edit_bid")
         await db.set_bundle_active(bid, False)
         scheduler_mgr.unschedule_bundle(bid)
+        _prev = await db.get_bundle(bid)
+        old_sid = _prev.get("session_id") if _prev else None
         await db.update_bundle_session(bid, sid)
+        if old_sid != sid:
+            await release_session(old_sid)
         await msg.answer("✅ تم استبدال الرقم. المجموعة متوقفة.")
         kb = await build_main_menu(msg.from_user.id)
         await msg.answer("اختر من القائمة:", reply_markup=kb)
@@ -527,7 +554,9 @@ async def cb_e_delnum(cb: CallbackQuery):
         await cb.answer("ليست لك.", show_alert=True); return
     await db.set_bundle_active(bid, False)
     scheduler_mgr.unschedule_bundle(bid)
+    old_sid = b.get("session_id")
     await db.clear_bundle_session(bid)
+    await release_session(old_sid)
     await render_bundle(cb, bid, edit=True)
     await cb.answer("🗑 تم حذف الرقم وإيقاف المجموعة.")
 
@@ -648,7 +677,9 @@ async def cb_e_delb(cb: CallbackQuery):
     if not b or b["user_id"] != cb.from_user.id:
         await cb.answer("ليست لك.", show_alert=True); return
     scheduler_mgr.unschedule_bundle(bid)
+    old_sid = b.get("session_id")
     await db.delete_bundle(bid)
+    await release_session(old_sid)
     kb = await build_main_menu(cb.from_user.id)
     await cb.message.edit_text(f"✅ تم حذف المجموعة #{bid}.", reply_markup=kb)
     await cb.answer("🗑")
