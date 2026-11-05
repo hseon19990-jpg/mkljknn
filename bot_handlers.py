@@ -1,7 +1,8 @@
-from aiogram import Router, F
+from aiogram import Router, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -236,17 +237,62 @@ async def release_stale_phone(phone):
         await ub_manager.drop_client(o["id"])
 
 
+# ---------------- Reset / Start shortcuts ----------------
+START_ALIASES = {
+    "start", "ستارت", "ابدأ", "ابدا", "بدء", "القائمة", "القائمه",
+    "menu", "الغاء", "إلغاء", "cancel", "🏠 ستارت",
+}
+
+
+def _is_reset_text(text):
+    if not text:
+        return False
+    t = text.strip()
+    if t.startswith("/debug_bundles"):
+        return False
+    if t.lstrip("/").strip().lower() in START_ALIASES:
+        return True
+    # أي أمر من كلمة واحدة يبدأ بـ / يلغي العملية الحالية
+    return t.startswith("/") and len(t) <= 30 and not any(c.isspace() for c in t)
+
+
+def _reply_shortcut():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🏠 ستارت")]],
+        resize_keyboard=True, is_persistent=True,
+    )
+
+
+class ResetStateOnCallback(BaseMiddleware):
+    """أي زر يُضغط يلغي العملية القديمة ويبدأ من الزر الجديد."""
+    async def __call__(self, handler, event, data):
+        state = data.get("state")
+        if state is not None:
+            await state.clear()
+        try:
+            await ub_manager.cancel_login(event.from_user.id)
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
+router.callback_query.outer_middleware(ResetStateOnCallback())
+
+
+@router.message(F.text.func(_is_reset_text))
 @router.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
+    await ub_manager.cancel_login(msg.from_user.id)
     if not await check_access(msg.from_user.id):
         await msg.answer("🚫 أنت محظور من استخدام البوت.")
         return
     if not await check_forced_channel(msg.bot, msg.from_user.id):
         await send_forced_subscribe(msg.bot, msg)
         return
+    await msg.answer("👋 مرحبًا بك!", reply_markup=_reply_shortcut())
     kb = await build_main_menu(msg.from_user.id)
-    await msg.answer("👋 مرحبًا بك!\nاختر من القائمة:", reply_markup=kb)
+    await msg.answer("اختر من القائمة:", reply_markup=kb)
 
 
 @router.callback_query(F.data == "check_sub")
