@@ -118,8 +118,12 @@ class UserbotManager:
     async def _finalize_login(self, user_id, ls):
         sid = await db.add_session(user_id, ls.phone, ls.session_name)
         self.clients[sid] = ls.client
-        self._register_listeners(sid, ls.client)
-        del self.login_sessions[user_id]
+        self.login_sessions.pop(user_id, None)
+        try:
+            self._register_listeners(sid, ls.client)
+        except Exception as e:
+            # فشل تسجيل المستمعين لا يجب أن يُفشل تسجيل الدخول نفسه
+            print(f"[Userbot] register listeners failed for {sid}: {e}")
         return ("success", sid)
 
     # ---------- Load existing sessions ----------
@@ -178,9 +182,11 @@ class UserbotManager:
             except Exception as e:
                 print(f"[Userbot edit] {e}")
 
-        @client.on(events.Album(incoming=True))
+        @client.on(events.Album())  # Album لا يقبل incoming=True
         async def _on_album(event):
             try:
+                if event.messages and getattr(event.messages[0], "out", False):
+                    return  # تجاهل رسائل الحساب نفسه
                 await self._process_event(session_id, event)
             except Exception as e:
                 print(f"[Userbot album] {e}")
