@@ -61,7 +61,24 @@ class UserbotManager:
         self._leave_jobs = {}
 
     # ---------- Login flow ----------
+    async def cancel_login(self, user_id):
+        """يلغي عملية تسجيل دخول معلّقة (نسي المستخدم الكود مثلاً) وينظّف بقاياها."""
+        ls = self.login_sessions.pop(user_id, None)
+        if not ls:
+            return
+        try:
+            await ls.client.disconnect()
+        except Exception:
+            pass
+        try:
+            path = os.path.join(SESSIONS_DIR, ls.session_name) + ".session"
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
     async def start_login(self, user_id, phone):
+        await self.cancel_login(user_id)
         session_name = f"u{user_id}_{int(asyncio.get_event_loop().time())}"
         path = os.path.join(SESSIONS_DIR, session_name)
         client = TelegramClient(path, API_ID, API_HASH)
