@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
@@ -24,12 +25,35 @@ from telethon.errors import (
 )
 from telethon.tl.functions.channels import LeaveChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.users import GetUsersRequest
+from telethon.tl.types import InputUserSelf, PeerChannel
+import telethon.errors as _tgerr
 
 from config import (
     API_ID, API_HASH, SESSIONS_DIR,
     CHANNEL_LIMIT_LEAVE_COUNT, LEAVE_DELAY_MINUTES,
+    SEND_TIMEOUT, JOIN_LINK_DEDUP_SECONDS,
 )
 import database as db
+import notify
+
+
+def _errs(*names):
+    """يبني tuple من أخطاء Telethon الموجودة فعلاً في النسخة المثبتة."""
+    return tuple(getattr(_tgerr, n) for n in names if hasattr(_tgerr, n))
+
+
+# الجلسة نفسها انتهت (حذف الحساب/حظره/إنهاء الجلسة من الجهاز/استخدامها من مكانين)
+DEAD_ERRORS = _errs(
+    "AuthKeyUnregisteredError", "UserDeactivatedError", "UserDeactivatedBanError",
+    "SessionRevokedError", "SessionExpiredError", "AuthKeyDuplicatedError",
+)
+# الحساب لا يستطيع الكتابة في هذا الكروب
+RESTRICTED_ERRORS = _errs(
+    "ChatWriteForbiddenError", "UserBannedInChannelError", "ChatAdminRequiredError",
+    "ChannelPrivateError", "ChatRestrictedError",
+)
+SLOWMODE_ERRORS = _errs("SlowModeWaitError")
 
 
 # يستخرج الروابط @username, t.me/xxx, t.me/+hash, t.me/joinchat/hash
@@ -53,12 +77,71 @@ class LoginSession:
         self.client = client
 
 
+def _make_client(path):
+    """عميل Telethon مع إعدادات اتصال أكثر صبراً (إعادة المحاولة تلقائياً)."""
+    return TelegramClient(
+        path, API_ID, API_HASH,
+        connection_retries=10, retry_delay=5, request_retries=5, auto_reconnect=True,
+    )
+
+
+def _is_invite_link(link):
+    return "t.me/+" in link or "joinchat/" in link
+
+
 class UserbotManager:
     def __init__(self):
         self.clients = {}
         self.login_sessions = {}
         self.scheduler = None
         self._leave_jobs = {}
+        # --- حماية الانضمام من الفلود ---
+        self._join_block = {}          # (session_id, kind) -> وقت انتهاء الحظر (monotonic)
+        self._seen_links = {}          # (session_id, link) -> آخر وقت جرّبناه
+        self.join_skipped = {}         # session_id -> عدد الروابط المتجاوزة بسبب الفلود
+        # --- حالة الحسابات ---
+        self._dialogs_refreshed = {}
+        self.last_resolve_flood = {}   # session_id -> ثواني الفلود عند آخر محاولة إضافة كروب
+        self._dead_reported = set()
+        self._sess_user = {}
+
+    # ---------- Events / helpers ----------
+    async def _user_of_session(self, session_id):
+        if session_id not in self._sess_user:
+            s = await db.get_session(session_id)
+            self._sess_user[session_id] = s["user_id"] if s else None
+        return self._sess_user[session_id]
+
+    async def _ev(self, kind, session_id, detail=None):
+        try:
+            await db.log_event(kind, await self._user_of_session(session_id), None,
+                               session_id, detail)
+        except Exception as e:
+            print(f"[Event] {kind}: {e}")
+
+    def _note_flood(self, session_id, link, err):
+        """يسجّل الفلود (إن كان الخطأ فلود) كي تُعرض للعضو رسالة واضحة بدل "تعذّر الوصول"."""
+        if isinstance(err, FloodWaitError):
+            kind, secs = self._set_join_block(session_id, link, err)
+            self.last_resolve_flood[session_id] = secs
+            print(f"[Resolve] FloodWait {secs}s ({kind}) [session {session_id}]")
+
+    def join_block_remaining(self, session_id, kind):
+        return max(0, int(self._join_block.get((session_id, kind), 0) - time.monotonic()))
+
+    def _set_join_block(self, session_id, link, err):
+        req = type(getattr(err, "request", None)).__name__
+        if "ResolveUsername" in req:
+            kind = "resolve"
+        elif "Invite" in req:
+            kind = "invite"
+        else:
+            kind = "invite" if _is_invite_link(link) else "resolve"
+        secs = int(getattr(err, "seconds", 60) or 60)
+        until = time.monotonic() + secs + 5
+        if until > self._join_block.get((session_id, kind), 0):
+            self._join_block[(session_id, kind)] = until
+        return kind, secs
 
     # ---------- Login flow ----------
     async def cancel_login(self, user_id):
@@ -81,7 +164,7 @@ class UserbotManager:
         await self.cancel_login(user_id)
         session_name = f"u{user_id}_{int(asyncio.get_event_loop().time())}"
         path = os.path.join(SESSIONS_DIR, session_name)
-        client = TelegramClient(path, API_ID, API_HASH)
+        client = _make_client(path)
         await client.connect()
         if await client.is_user_authorized():
             return ("already_authorized", client)
@@ -134,7 +217,7 @@ class UserbotManager:
             if not os.path.exists(path + ".session"):
                 continue
             try:
-                client = TelegramClient(path, API_ID, API_HASH)
+                client = _make_client(path)
                 await client.connect()
                 if await client.is_user_authorized():
                     self.clients[s["id"]] = client
@@ -209,6 +292,7 @@ class UserbotManager:
             "SELECT * FROM bundles WHERE session_id=?", (session_id,)
         )
         matched = False
+        allow_join = False
         for b in bundles:
             if b.get("group_id"):
                 grp = await db.get_group(b["group_id"])
@@ -216,10 +300,11 @@ class UserbotManager:
                     # المقارنة تاخذ بالحسبان الصيغ المختلفة للـ ID
                     if int(grp["group_id"]) == int(chat_id) or str(grp["group_id"]) in str(chat_id):
                         matched = True
-                        break
+                        if b.get("auto_join") in (None, 1):
+                            allow_join = True
                         
         # إذا لم يكن مرتبطاً بـ bundle، نتخطاه (إلا إذا كنا نريد طباعة كل شيء للتشخيص)
-        if not matched:
+        if not matched or not allow_join:
             return
 
         # 3. تجاهل المحظورين
@@ -301,6 +386,28 @@ class UserbotManager:
         return "\n".join(parts)
 
     async def _open_and_join(self, session_id, client, link):
+        """غلاف: يمنع التكرار، ويوقف محاولات الانضمام مؤقتاً عند الفلود بدل إغراق تلغرام."""
+        now = time.monotonic()
+        key = (session_id, link)
+        last = self._seen_links.get(key)
+        if last and now - last < JOIN_LINK_DEDUP_SECONDS:
+            return                      # نفس الرابط جُرّب قبل قليل
+        kind = "invite" if _is_invite_link(link) else "resolve"
+        if self.join_block_remaining(session_id, kind) > 0:
+            self.join_skipped[session_id] = self.join_skipped.get(session_id, 0) + 1
+            return                      # الحساب تحت فلود لهذا النوع من الطلبات
+        self._seen_links[key] = now
+        if len(self._seen_links) > 5000:   # تنظيف الذاكرة
+            cutoff = now - JOIN_LINK_DEDUP_SECONDS
+            self._seen_links = {k: v for k, v in self._seen_links.items() if v > cutoff}
+        try:
+            await self._open_and_join_inner(session_id, client, link)
+        except FloodWaitError as e:
+            kind, secs = self._set_join_block(session_id, link, e)
+            print(f"[Join] FloodWait {secs}s ({kind}) — الانضمام موقوف لهذا الحساب {secs}s [session {session_id}]")
+            await self._ev("join_flood", session_id, f"{kind} {secs}s")
+
+    async def _open_and_join_inner(self, session_id, client, link):
         """
         يحاول فتح الرابط. إذا كان قناة/مجموعة → ينضم.
         إذا كان بوت/شخص → يتجاهل.
@@ -321,6 +428,8 @@ class UserbotManager:
                 ent = await self._resolve_invite(client, link)
             if ent is None:
                 return
+        except FloodWaitError:
+            raise
         except Exception as e:
             print(f"[Open] get_entity({link}): {e}")
             await self._join_direct(session_id, client, link)
@@ -347,11 +456,15 @@ class UserbotManager:
                 res = await client(CheckChatInviteRequest(hash_part))
                 if hasattr(res, "chat"):
                     return res.chat
+            except FloodWaitError:
+                raise
             except Exception:
                 pass
             upd = await client(ImportChatInviteRequest(hash_part))
             if upd.chats:
                 return upd.chats[0]
+        except FloodWaitError:
+            raise
         except (InviteHashExpiredError, InviteHashInvalidError):
             print(f"[Invite] {link}: Expired/Invalid")
             return None
@@ -360,49 +473,62 @@ class UserbotManager:
         return None
 
     async def _do_join(self, client, link, ent=None):
-        """Telethon لا يملك join_chat — نستخدم الطلبات الصحيحة."""
+        """Telethon لا يملك join_chat — نستخدم الطلبات الصحيحة. يعيد الكيان الذي انضممنا له."""
         if "t.me/+" in link or "joinchat/" in link:
             h = link.split("joinchat/")[-1] if "joinchat/" in link else link.split("+")[-1]
-            await client(ImportChatInviteRequest(h.strip("/")))
-        else:
-            target = ent if ent is not None else await client.get_input_entity(link)
-            await client(JoinChannelRequest(target))
+            res = await client(ImportChatInviteRequest(h.strip("/")))
+            chats = getattr(res, "chats", None)
+            return chats[0] if chats else None
+        target = ent if ent is not None else await client.get_input_entity(link)
+        res = await client(JoinChannelRequest(target))
+        chats = getattr(res, "chats", None)
+        return chats[0] if chats else ent
 
     async def _join_direct(self, session_id, client, link, ent=None):
         joined = False
+        chat = None
         try:
-            await self._do_join(client, link, ent)
+            chat = await self._do_join(client, link, ent)
             joined = True
             print(f"[Join] OK: {link}")
+            await self._ev("join_ok", session_id, link)
         except UserAlreadyParticipantError:
             joined = True
+            chat = ent
             print(f"[Join] Already in: {link}")
         except ChannelsTooMuchError:
             print(f"[Join] Limit hit. Leaving {CHANNEL_LIMIT_LEAVE_COUNT} channels...")
             await self._leave_oldest_channels(client, count=CHANNEL_LIMIT_LEAVE_COUNT)
             try:
-                await self._do_join(client, link, ent)
+                chat = await self._do_join(client, link, ent)
                 joined = True
                 print(f"[Join] OK after leave: {link}")
+                await self._ev("join_ok", session_id, link)
             except Exception as e:
                 print(f"[Join retry] {link}: {e}")
+                await self._ev("join_fail", session_id, f"{link}: {type(e).__name__}")
         except FloodWaitError as e:
-            print(f"[Join] FloodWait {e.seconds}s on {link}")
+            kind, secs = self._set_join_block(session_id, link, e)
+            print(f"[Join] FloodWait {secs}s on {link} — الانضمام موقوف {secs}s [session {session_id}]")
+            await self._ev("join_flood", session_id, f"{kind} {secs}s")
             return
         except InviteRequestSentError:
             print(f"[Join] Join request sent (needs approval): {link}")
+            await self._ev("join_pending", session_id, link)
             return
         except (InviteHashExpiredError, InviteHashInvalidError):
             print(f"[Join] Expired/invalid invite: {link}")
             return
         except Exception as e:
             print(f"[Join] {link}: {type(e).__name__} {e}")
+            await self._ev("join_fail", session_id, f"{link}: {type(e).__name__}")
             return
 
         if joined and self.scheduler:
-            self._schedule_leave_job(session_id, link)
+            chat_id = getattr(chat, "id", None) if isinstance(chat, (Channel, Chat)) else None
+            self._schedule_leave_job(session_id, link, chat_id)
 
-    def _schedule_leave_job(self, session_id, link):
+    def _schedule_leave_job(self, session_id, link, chat_id=None):
         job_id = f"leave_{session_id}_{hash(link) & 0xffffffff}"
         try:
             self.scheduler.scheduler.remove_job(job_id)
@@ -413,7 +539,7 @@ class UserbotManager:
         self.scheduler.scheduler.add_job(
             self._leave_channel,
             trigger=DateTrigger(run_date=run_at),
-            args=[session_id, link],
+            args=[session_id, link, chat_id],
             id=job_id,
             replace_existing=True,
         )
@@ -436,56 +562,169 @@ class UserbotManager:
         except Exception as e:
             print(f"[LeaveOld] Error: {e}")
 
-    async def _leave_channel(self, session_id, link):
+    async def _leave_channel(self, session_id, link, chat_id=None):
         client = self.get_client(session_id)
         if not client:
             return
         try:
-            ent = await client.get_entity(link)
-            await client(LeaveChannelRequest(ent))
+            ent = None
+            if chat_id:
+                # نستخدم المعرّف المخزّن محلياً: لا يسبّب ResolveUsername (سبب الفلود الطويل)
+                for peer in (PeerChannel(chat_id), chat_id):
+                    try:
+                        ent = await client.get_input_entity(peer)
+                        break
+                    except Exception:
+                        continue
+            if ent is None:
+                ent = await client.get_entity(link)
+            if isinstance(ent, Chat):
+                await client.delete_dialog(ent)
+            else:
+                await client(LeaveChannelRequest(ent))
             print(f"[Leave] {link}")
+        except FloodWaitError as e:
+            print(f"[Leave] {link}: FloodWait {e.seconds}s")
         except Exception as e:
             print(f"[Leave] {link}: {e}")
 
+    # ---------- Connection health ----------
+    async def _ensure_connected(self, client):
+        if client.is_connected():
+            return True
+        try:
+            await asyncio.wait_for(client.connect(), 30)
+        except Exception as e:
+            print(f"[Connect] {type(e).__name__}: {e}")
+        return client.is_connected()
+
+    async def watchdog(self):
+        """يفحص كل الحسابات: يعيد الاتصال إذا انقطع ويكشف الجلسات الميتة."""
+        rep = {"ok": 0, "reconnected": 0, "failed": 0, "dead": 0}
+        for sid, client in list(self.clients.items()):
+            try:
+                if not client.is_connected():
+                    if not await self._ensure_connected(client):
+                        rep["failed"] += 1
+                        print(f"[Watchdog] session {sid}: فشلت إعادة الاتصال")
+                        await self._ev("reconnect_fail", sid, "watchdog")
+                        continue
+                    rep["reconnected"] += 1
+                    print(f"[Watchdog] session {sid}: أُعيد الاتصال")
+                    await self._ev("reconnect", sid, "watchdog")
+                # ping خفيف يكشف الجلسة الملغاة
+                await asyncio.wait_for(client(GetUsersRequest([InputUserSelf()])), 30)
+                rep["ok"] += 1
+            except DEAD_ERRORS as e:
+                rep["dead"] += 1
+                await self.handle_dead_session(sid, type(e).__name__)
+            except FloodWaitError as e:
+                rep["ok"] += 1
+                print(f"[Watchdog] session {sid}: FloodWait {e.seconds}s (تجاهل)")
+            except Exception as e:
+                rep["failed"] += 1
+                print(f"[Watchdog] session {sid}: {type(e).__name__}: {e}")
+        return rep
+
+    async def handle_dead_session(self, session_id, reason):
+        """الجلسة لم تعد صالحة: أوقف مجموعاتها وأبلغ العضو والمالك (مرة واحدة)."""
+        if session_id in self._dead_reported:
+            return
+        self._dead_reported.add(session_id)
+        s = await db.get_session(session_id)
+        phone = s["phone"] if s else str(session_id)
+        user_id = s["user_id"] if s else None
+        bundles = await db._fetchall("SELECT * FROM bundles WHERE session_id=?", (session_id,))
+        for b in bundles:
+            if b["is_active"]:
+                await db.set_bundle_active(b["id"], False)
+                if self.scheduler:
+                    self.scheduler.unschedule_bundle(b["id"])
+            await notify.notify_user(
+                b["user_id"],
+                f"⚠️ توقفت المجموعة «{b.get('name') or b['id']}» لأن جلسة الرقم {phone} "
+                f"لم تعد صالحة ({reason}).\n"
+                f"افتح المجموعة ← 📱 تغيير الرقم وسجّل الدخول من جديد.", force=True)
+        await db.log_event("session_dead", user_id, None, session_id, f"{phone}: {reason}")
+        await notify.notify_owner(f"⚠️ جلسة ميتة: #{session_id} ({phone}) — {reason}")
+        print(f"[Dead] session {session_id} ({phone}): {reason}")
+
     # ---------- Sending with reply ----------
-    async def send_with_reply(self, session_id, group_id, text):
+    async def _input_peer(self, client, session_id, group_id):
+        try:
+            return await client.get_input_entity(group_id)
+        except (ValueError, TypeError):
+            pass
+        # الكيان غير موجود في الكاش: نحدّث الحوارات (مرة كل 30 دقيقة كحد أقصى)
+        last = self._dialogs_refreshed.get(session_id, 0)
+        if time.monotonic() - last > 1800:
+            self._dialogs_refreshed[session_id] = time.monotonic()
+            try:
+                await client.get_dialogs(limit=300)
+                return await client.get_input_entity(group_id)
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    async def _send_inner(self, client, session_id, group_id, text, mode):
+        peer = await self._input_peer(client, session_id, group_id)
+        if peer is None:
+            return ("error", "entity_not_found")
+        reply_to = None
+        if mode in ("reply", "auto"):
+            reply_to = await self._find_reply_target(client, peer)
+            if reply_to is None and mode == "reply":
+                return ("no_target", None)
+        await client.send_message(peer, text, reply_to=reply_to)
+        return ("ok", "reply" if reply_to else "plain")
+
+    async def send_with_reply(self, session_id, group_id, text, mode="auto"):
+        """
+        يرسل رسالة للكروب. الحالات:
+        ok | flood | slowmode | no_target | restricted | dead | conn | error
+        """
         client = self.get_client(session_id)
         if not client:
             return ("error", "no_client")
-        reply_to = await self._find_reply_target(client, group_id)
-        if reply_to is None:
-            return ("no_target", None)
+        if not await self._ensure_connected(client):
+            return ("conn", "disconnected")
         try:
-            await client.send_message(group_id, text, reply_to=reply_to)
-            return ("ok", None)
+            return await asyncio.wait_for(
+                self._send_inner(client, session_id, group_id, text, mode), SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            return ("conn", "timeout")
         except FloodWaitError as e:
             return ("flood", e.seconds)
-        except (ChatWriteForbiddenError, UserBannedInChannelError):
-            return ("restricted", None)
+        except SLOWMODE_ERRORS as e:
+            return ("slowmode", getattr(e, "seconds", 60))
+        except DEAD_ERRORS as e:
+            return ("dead", type(e).__name__)
+        except RESTRICTED_ERRORS as e:
+            return ("restricted", type(e).__name__)
+        except (ConnectionError, OSError) as e:
+            return ("conn", f"{type(e).__name__}: {e}")
         except Exception as e:
-            return ("error", str(e))
+            return ("error", f"{type(e).__name__}: {e}")
 
-    async def _find_reply_target(self, client, group_id):
-        try:
-            messages = await client.get_messages(group_id, limit=30)
-            for msg in messages:
-                if getattr(msg, "out", False):
-                    continue
-                if not msg.from_id:
-                    continue
-                try:
-                    sender = await msg.get_sender()
-                except Exception:
-                    continue
-                if not sender:
-                    continue
-                if getattr(sender, "bot", False):
-                    continue
-                if await db.is_blocked(sender.id):
-                    continue
-                return msg.id
-        except Exception:
-            pass
+    async def _find_reply_target(self, client, peer):
+        """آخر رسالة من عضو حقيقي (ليس بوتاً ولا محظوراً ولا الحساب نفسه)."""
+        messages = await client.get_messages(peer, limit=30)   # الأخطاء الحقيقية تصعد للمُرسِل
+        for msg in messages:
+            if getattr(msg, "out", False):
+                continue
+            if not msg.from_id:
+                continue
+            try:
+                sender = await msg.get_sender()
+            except Exception:
+                continue
+            if not sender:
+                continue
+            if getattr(sender, "bot", False):
+                continue
+            if await db.is_blocked(sender.id):
+                continue
+            return msg.id
         return None
 
     # ---------- Resolve group (لإضافة كروب جديد) ----------
@@ -493,6 +732,7 @@ class UserbotManager:
         client = self.get_client(session_id)
         if not client:
             return None
+        self.last_resolve_flood.pop(session_id, None)
         link = (link or "").strip()
         if not link:
             return None
@@ -503,10 +743,12 @@ class UserbotManager:
                 try:
                     await self._do_join(client, link)
                 except Exception as e:
+                    self._note_flood(session_id, link, e)
                     print(f"[Resolve invite join] {e}")
                 try:
                     ent = await client.get_entity(link)
                 except Exception as e:
+                    self._note_flood(session_id, link, e)
                     print(f"[Resolve invite entity] {e}")
                     return None
             title = getattr(ent, "title", str(ent.id))
@@ -523,6 +765,7 @@ class UserbotManager:
                         await self._do_join(client, link)
                         ent = await client.get_entity(link)
                     except Exception as e:
+                        self._note_flood(session_id, link, e)
                         print(f"[Resolve @] {e}")
                         return None
             else:
@@ -533,6 +776,7 @@ class UserbotManager:
             title = getattr(ent, "title", str(ent.id))
             return (ent.id, title)
         except Exception as e:
+            self._note_flood(session_id, link, e)
             print(f"[Resolve] {e}")
             return None
 

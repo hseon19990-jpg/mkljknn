@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 import database as db
+import reports
 from config import OWNER_ID
 from userbot import ub_manager
 from scheduler import scheduler_mgr
@@ -131,6 +132,10 @@ async def build_main_menu(user_id):
             callback_data=f"openb_{b['id']}"
         )])
     kb.append([InlineKeyboardButton(text="➕ إضافة مجموعة", callback_data="add_bundle")])
+    kb.append([
+        InlineKeyboardButton(text="📊 إحصائياتي", callback_data="m_stats"),
+        InlineKeyboardButton(text="⚙️ إعداداتي", callback_data="m_settings"),
+    ])
     kb.append([InlineKeyboardButton(text="🎬 عرض شرح البوت", callback_data="show_tutorial")])
     if user_id == OWNER_ID:
         kb.append([InlineKeyboardButton(text="⚙️ لوحة المالك", callback_data="owner_menu")])
@@ -149,6 +154,23 @@ def bundle_detail_menu(bid, has_session, has_group, has_cliche, is_active):
         [InlineKeyboardButton(text=grp_label, callback_data=f"e_grp_{bid}")],
         [InlineKeyboardButton(text="🗑️ حذف الرقم", callback_data=f"e_delnum_{bid}")],
         [InlineKeyboardButton(text="⏱️ المؤقت", callback_data=f"e_timer_{bid}")],
+        [
+            InlineKeyboardButton(text="📊 إحصائيات", callback_data=f"x_stats_{bid}"),
+            InlineKeyboardButton(text="📋 السجل", callback_data=f"x_log_{bid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🧪 إرسال تجريبي", callback_data=f"x_test_{bid}"),
+            InlineKeyboardButton(text="✏️ تسمية", callback_data=f"x_name_{bid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔁 وضع الإرسال", callback_data=f"x_mode_{bid}"),
+            InlineKeyboardButton(text="🤖 الانضمام التلقائي", callback_data=f"x_join_{bid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🕒 ساعات العمل", callback_data=f"x_hours_{bid}"),
+            InlineKeyboardButton(text="📈 حد يومي", callback_data=f"x_daily_{bid}"),
+        ],
+        [InlineKeyboardButton(text="💬 كليشات إضافية", callback_data=f"x_clis_{bid}")],
         [InlineKeyboardButton(text="🗑 حذف المجموعة", callback_data=f"e_delb_{bid}")],
         [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_main")],
     ])
@@ -156,8 +178,26 @@ def bundle_detail_menu(bid, has_session, has_group, has_cliche, is_active):
 
 def owner_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚫 حظر عضو/بوت", callback_data="own_block")],
-        [InlineKeyboardButton(text="✅ إلغاء حظر", callback_data="own_unblock")],
+        [
+            InlineKeyboardButton(text="📊 الإحصائيات", callback_data="ow_stats"),
+            InlineKeyboardButton(text="👥 الأعضاء", callback_data="ow_users"),
+        ],
+        [
+            InlineKeyboardButton(text="📦 المجموعات", callback_data="ow_bundles_0"),
+            InlineKeyboardButton(text="📱 الحسابات", callback_data="ow_sessions"),
+        ],
+        [
+            InlineKeyboardButton(text="📣 إذاعة", callback_data="ow_broadcast"),
+            InlineKeyboardButton(text="📜 السجلات", callback_data="ow_logs"),
+        ],
+        [
+            InlineKeyboardButton(text="🎛 التحكم والإعدادات", callback_data="ow_control"),
+            InlineKeyboardButton(text="💾 نسخة احتياطية", callback_data="ow_export"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 حظر عضو/بوت", callback_data="own_block"),
+            InlineKeyboardButton(text="✅ إلغاء حظر", callback_data="own_unblock"),
+        ],
         [InlineKeyboardButton(text="💬 كليشات الأدمن", callback_data="own_cliches")],
         [InlineKeyboardButton(text="📢 تعيين القناة الإجبارية", callback_data="own_forced")],
         [InlineKeyboardButton(text="📊 تحديد حدود عضو", callback_data="own_limits")],
@@ -183,16 +223,32 @@ async def _bundle_detail_text(b):
     sess_txt = sess["phone"] if sess else "❌ لا يوجد"
     grp_txt = (grp["group_title"] or str(grp["group_id"])) if grp else "❌ لا يوجد"
     cli_txt = (cli["text"][:40]) if cli else "❌ لا يوجد"
-    state_txt = "🟢 تعمل" if b["is_active"] else "🔴 متوقفة"
+    state_txt = await reports.bundle_state_label(b)
     name = b.get("name") or f"المجموعة #{b['id']}"
-    return (
-        f"📦 {name}\n\n"
-        f"📱 الرقم: {sess_txt}\n"
-        f"👥 الكروب: {grp_txt}\n"
-        f"💬 الكليشة: {cli_txt}\n"
-        f"⏱️ المؤقت: {b['interval']} ثانية\n"
-        f"الحالة: {state_txt}\n"
-    )
+    extras = await db.count_bundle_cliches(b["id"])
+    tz = await db.get_tz_offset()
+    today_ok = await db.count_ok_posts(b["id"], db.day_start_utc_str(tz))
+    daily = b.get("daily_limit") or 0
+    lines = [
+        f"📦 {name}",
+        "",
+        f"📱 الرقم: {sess_txt}",
+        f"👥 الكروب: {grp_txt}",
+        f"💬 الكليشة: {cli_txt}" + (f"  (+{extras} إضافية)" if extras else ""),
+        f"⏱️ المؤقت: {b['interval']} ثانية",
+        f"🔁 الوضع: {reports.mode_label(b.get('mode'))}",
+        f"🕒 ساعات العمل: {reports.hours_label(b)}",
+        f"📈 الحد اليومي: {daily if daily else 'بلا حد'}",
+        f"🤖 الانضمام التلقائي: {'✅' if b.get('auto_join') in (None, 1) else '❌'}",
+        "",
+        f"الحالة: {state_txt}",
+        f"✅ المرسل: {b.get('total_sent') or 0}  (اليوم {today_ok})",
+    ]
+    if b.get("last_post_at"):
+        lines.append(f"📨 آخر نشر: {reports.ago(b['last_post_at'])}")
+    if b.get("last_error"):
+        lines.append(f"❗ آخر خطأ: {b['last_error']}")
+    return "\n".join(lines)
 
 
 async def render_bundle(cb_or_msg, bid, edit=True):
@@ -219,6 +275,26 @@ async def render_bundle(cb_or_msg, bid, edit=True):
         await cb_or_msg.answer(text, reply_markup=kb)
 
 
+def _group_fail_text(session_id):
+    secs = ub_manager.last_resolve_flood.get(session_id)
+    if secs:
+        mins = max(1, secs // 60)
+        return (f"⏳ تلغرام فرض انتظاراً على هذا الحساب (~{mins} دقيقة) فلا يستطيع فتح الروابط الآن.\n"
+                "جرّب إرسال ID الكروب الرقمي (مثل -100123456789) أو أعد المحاولة بعد انتهاء المدة.")
+    return "❌ لم أتمكن من الوصول للكروب. حاول مرة أخرى (رابط/يوزر/ID):"
+
+
+async def stop_user_bundles(uid):
+    """يوقف كل مجموعات عضو (عند الحظر مثلاً). يعيد عدد ما أُوقف."""
+    n = 0
+    for b in await db.get_user_bundles(uid):
+        if b["is_active"]:
+            await db.set_bundle_active(b["id"], False)
+            scheduler_mgr.unschedule_bundle(b["id"])
+            n += 1
+    return n
+
+
 # ---------------- /start ----------------
 async def release_session(sid):
     """إذا لم تعد الجلسة مرتبطة بأي مجموعة: نعطّلها ونفصل الحساب ليمكن إضافة الرقم من جديد."""
@@ -228,6 +304,19 @@ async def release_session(sid):
         return
     await db.deactivate_session(sid)
     await ub_manager.drop_client(sid)
+
+
+async def delete_user_bundles(uid):
+    """يحذف كل مجموعات عضو ويحرر أرقامه. يعيد العدد."""
+    n = 0
+    for b in await db.get_user_bundles(uid):
+        scheduler_mgr.unschedule_bundle(b["id"])
+        sid = b.get("session_id")
+        await db.delete_bundle(b["id"])
+        await db.delete_bundle_cliches(b["id"])
+        await release_session(sid)
+        n += 1
+    return n
 
 
 async def release_stale_phone(phone):
@@ -248,7 +337,7 @@ def _is_reset_text(text):
     if not text:
         return False
     t = text.strip()
-    if t.startswith("/debug_bundles"):
+    if t.startswith(("/debug_bundles", "/stats", "/health")):
         return False
     if t.lstrip("/").strip().lower() in START_ALIASES:
         return True
@@ -290,7 +379,8 @@ async def cmd_start(msg: Message, state: FSMContext):
     if not await check_forced_channel(msg.bot, msg.from_user.id):
         await send_forced_subscribe(msg.bot, msg)
         return
-    await msg.answer("👋 مرحبًا بك!", reply_markup=_reply_shortcut())
+    welcome = await db.get_setting("welcome_text", "👋 مرحبًا بك!")
+    await msg.answer(welcome, reply_markup=_reply_shortcut())
     kb = await build_main_menu(msg.from_user.id)
     await msg.answer("اختر من القائمة:", reply_markup=kb)
 
@@ -352,6 +442,10 @@ async def cb_open_bundle(cb: CallbackQuery):
 async def cb_add_bundle(cb: CallbackQuery, state: FSMContext):
     if not await check_access(cb.from_user.id):
         await cb.answer(); return
+    lim = await db.get_limits(cb.from_user.id)
+    if cb.from_user.id != OWNER_ID and await db.count_user_bundles(cb.from_user.id) >= lim["max_groups"]:
+        await cb.answer(f"⚠️ وصلت للحد الأقصى من المجموعات ({lim['max_groups']}).", show_alert=True)
+        return
     await cb.message.answer("📝 أرسل اسم المجموعة الجديدة:")
     await state.set_state(NewBundle.waiting_name)
     await cb.answer("📝")
@@ -376,6 +470,10 @@ async def new_bundle_name(msg: Message, state: FSMContext):
 @router.message(NewBundle.waiting_number_phone)
 async def new_bundle_phone(msg: Message, state: FSMContext):
     phone = msg.text.strip()
+    lim = await db.get_limits(msg.from_user.id)
+    if msg.from_user.id != OWNER_ID and await db.count_user_sessions(msg.from_user.id) >= lim["max_numbers"]:
+        await msg.answer(f"⚠️ وصلت للحد الأقصى من الأرقام ({lim['max_numbers']}).")
+        return
     await release_stale_phone(phone)
     if await db.session_phone_exists(phone):
         await msg.answer("⚠️ هذا الرقم مسجل بالفعل.\nأرسل رقماً آخر.")
@@ -432,7 +530,7 @@ async def new_bundle_group(msg: Message, state: FSMContext):
         await state.clear(); return
     result = await ub_manager.resolve_group(b["session_id"], msg.text.strip())
     if not result:
-        await msg.answer("❌ لم أتمكن من الوصول للكروب. حاول مرة أخرى (رابط/يوزر/ID):")
+        await msg.answer(_group_fail_text(b["session_id"]))
         return
     gid, title = result
     gdb_id = await db.add_group(msg.from_user.id, gid, title)
@@ -530,6 +628,13 @@ async def cb_e_num(cb: CallbackQuery, state: FSMContext):
 @router.message(EditBundle.add_number_phone)
 async def edit_num_phone(msg: Message, state: FSMContext):
     phone = msg.text.strip()
+    d = await state.get_data()
+    cur_b = await db.get_bundle(d.get("edit_bid")) if d.get("edit_bid") else None
+    if cur_b and not cur_b.get("session_id") and msg.from_user.id != OWNER_ID:
+        lim = await db.get_limits(msg.from_user.id)
+        if await db.count_user_sessions(msg.from_user.id) >= lim["max_numbers"]:
+            await msg.answer(f"⚠️ وصلت للحد الأقصى من الأرقام ({lim['max_numbers']}).")
+            return
     await release_stale_phone(phone)
     if await db.session_phone_exists(phone):
         await msg.answer("⚠️ هذا الرقم مسجل بالفعل.\nأرسل رقماً آخر.")
@@ -634,7 +739,7 @@ async def edit_group_link(msg: Message, state: FSMContext):
         await state.clear(); return
     result = await ub_manager.resolve_group(b["session_id"], msg.text.strip())
     if not result:
-        await msg.answer("❌ لم أتمكن من الوصول للكروب. حاول مرة أخرى:")
+        await msg.answer(_group_fail_text(b["session_id"]))
         return
     gid, title = result
     gdb_id = await db.add_group(msg.from_user.id, gid, title)
@@ -725,6 +830,7 @@ async def cb_e_delb(cb: CallbackQuery):
     scheduler_mgr.unschedule_bundle(bid)
     old_sid = b.get("session_id")
     await db.delete_bundle(bid)
+    await db.delete_bundle_cliches(bid)
     await release_session(old_sid)
     kb = await build_main_menu(cb.from_user.id)
     await cb.message.edit_text(f"✅ تم حذف المجموعة #{bid}.", reply_markup=kb)
@@ -753,7 +859,8 @@ async def proc_block(msg: Message, state: FSMContext):
     try:
         eid = int(msg.text.strip())
         await db.block_entity(eid, "user")
-        await msg.answer(f"✅ تم حظر {eid}.")
+        stopped = await stop_user_bundles(eid)
+        await msg.answer(f"✅ تم حظر {eid}." + (f"\n⏸ أُوقفت {stopped} مجموعة له." if stopped else ""))
     except ValueError:
         await msg.answer("❌ أرسل ID رقمي.")
     await state.clear()
@@ -881,7 +988,11 @@ async def proc_forced(msg: Message, state: FSMContext):
 @router.callback_query(F.data == "own_limits")
 async def cb_own_limits(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != OWNER_ID: await cb.answer(); return
-    await cb.message.answer("أرسل: user_id max_numbers max_groups max_cliches")
+    d = await db.get_default_limits()
+    await cb.message.answer(
+        "أرسل: user_id max_numbers max_groups max_cliches\n"
+        f"(الافتراضي العام الآن: أرقام {d['max_numbers']} · مجموعات {d['max_groups']} · كليشات {d['max_cliches']})\n"
+        "لإرجاع عضو للافتراضي أرسل: user_id reset")
     await state.set_state(OwnerFlow.set_limits_wait)
     await cb.answer("📊")
 
@@ -889,6 +1000,11 @@ async def cb_own_limits(cb: CallbackQuery, state: FSMContext):
 @router.message(OwnerFlow.set_limits_wait)
 async def proc_limits(msg: Message, state: FSMContext):
     parts = msg.text.split()
+    if len(parts) == 2 and parts[1].lower() == "reset" and parts[0].lstrip("-").isdigit():
+        await db.reset_limits(int(parts[0]))
+        await msg.answer(f"✅ رُجعت حدود {parts[0]} إلى الافتراضي.")
+        await state.clear()
+        return
     if len(parts) != 4:
         await msg.answer("❌ صيغة غير صحيحة.")
         return
